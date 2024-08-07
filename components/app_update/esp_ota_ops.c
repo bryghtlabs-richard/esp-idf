@@ -38,7 +38,7 @@
 typedef struct ota_ops_entry_ {
     uint32_t handle;
     const esp_partition_t *part;
-    bool need_erase;
+    uint32_t erased_size;
     uint32_t wrote_size;
     uint8_t partial_bytes;
     WORD_ALIGNED_ATTR uint8_t partial_data[16];
@@ -144,13 +144,16 @@ esp_err_t esp_ota_begin(const esp_partition_t *partition, size_t image_size, esp
     }
 #endif
 
+    uint32_t first_erase_size = 0;
     if (image_size != OTA_WITH_SEQUENTIAL_WRITES) {
         // If input image size is 0 or OTA_SIZE_UNKNOWN, erase entire partition
         if ((image_size == 0) || (image_size == OTA_SIZE_UNKNOWN)) {
             ret = esp_partition_erase_range(partition, 0, partition->size);
+            first_erase_size = partition->size;
         } else {
             const int aligned_erase_size = (image_size + SPI_FLASH_SEC_SIZE - 1) & ~(SPI_FLASH_SEC_SIZE - 1);
             ret = esp_partition_erase_range(partition, 0, aligned_erase_size);
+            first_erase_size = aligned_erase_size;
         }
         if (ret != ESP_OK) {
             return ret;
@@ -166,10 +169,12 @@ esp_err_t esp_ota_begin(const esp_partition_t *partition, size_t image_size, esp
 
     new_entry->part = partition;
     new_entry->handle = ++s_ota_ops_last_handle;
-    new_entry->need_erase = (image_size == OTA_WITH_SEQUENTIAL_WRITES);
+    new_entry->erased_size = first_erase_size;
     *out_handle = new_entry->handle;
     return ESP_OK;
 }
+
+#define SPI_FLASH_BLK_SIZE (64*1024)
 
 esp_err_t esp_ota_write(esp_ota_handle_t handle, const void *data, size_t size)
 {
@@ -190,20 +195,28 @@ esp_err_t esp_ota_write(esp_ota_handle_t handle, const void *data, size_t size)
     // find ota handle in linked list
     for (it = LIST_FIRST(&s_ota_ops_entries_head); it != NULL; it = LIST_NEXT(it, entries)) {
         if (it->handle == handle) {
-            if (it->need_erase) {
+            if (it->wrote_size + size > it->erased_size) {
                 // must erase the partition before writing to it
                 uint32_t first_sector = it->wrote_size / SPI_FLASH_SEC_SIZE; // first affected sector
                 uint32_t last_sector = (it->wrote_size + size - 1) / SPI_FLASH_SEC_SIZE; // last affected sector
 
-                ret = ESP_OK;
-                if ((it->wrote_size % SPI_FLASH_SEC_SIZE) == 0) {
-                    ret = esp_partition_erase_range(it->part, it->wrote_size, ((last_sector - first_sector) + 1) * SPI_FLASH_SEC_SIZE);
-                } else if (first_sector != last_sector) {
-                    ret = esp_partition_erase_range(it->part, (first_sector + 1) * SPI_FLASH_SEC_SIZE, (last_sector - first_sector) * SPI_FLASH_SEC_SIZE);
+                uint32_t erase_sectors = (last_sector - first_sector) + 1;
+                uint32_t erase_len = erase_sectors * SPI_FLASH_SEC_SIZE;
+
+                //Erase out to the next block boundary, if available
+                uint32_t next_raw_block = (it->part->address + it->erased_size + size + SPI_FLASH_BLK_SIZE - 1) / SPI_FLASH_BLK_SIZE;
+                uint32_t next_block = next_raw_block * SPI_FLASH_BLK_SIZE - it->part->address;
+                if(next_block < it->part->address + it->part->size && erase_len < next_block - it->erased_size){
+                    erase_len = next_block - it->erased_size;
                 }
+
+                ESP_LOGI(TAG, "erasing 0x%" PRIx32 " to 0x%" PRIx32, it->erased_size, it->erased_size + erase_len);
+
+                ret = esp_partition_erase_range(it->part, it->erased_size, erase_len);
                 if (ret != ESP_OK) {
                     return ret;
                 }
+                it->erased_size += erase_len;
             }
 
             if (it->wrote_size == 0 && it->partial_bytes == 0 && size > 0 && data_bytes[0] != ESP_IMAGE_HEADER_MAGIC) {
@@ -271,7 +284,7 @@ esp_err_t esp_ota_write_with_offset(esp_ota_handle_t handle, const void *data, s
     for (it = LIST_FIRST(&s_ota_ops_entries_head); it != NULL; it = LIST_NEXT(it, entries)) {
         if (it->handle == handle) {
             // must erase the partition before writing to it
-            assert(it->need_erase == 0 && "must erase the partition before writing to it");
+            assert(offset < it->erased_size && "must erase the partition before writing to it");
 
             /* esp_ota_write_with_offset is used to write data in non contiguous manner.
              * Hence, unaligned data(less than 16 bytes) cannot be cached if flash encryption is enabled.
